@@ -1,0 +1,217 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Real-Time News Streaming System
+# Phase 1: zookeeper + kafka + crawler-service + telegram-service
+# Phase 2: flink (use --profile flink to enable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  news-net:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  flink-checkpoints:
+  minio-data:
+
+services:
+
+  # ───── KAFKA ─────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    platform: linux/arm64
+    container_name: kafka
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "9093:9093"   # accessible from host for debugging
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - news-net
+
+  # ───── KAFKA INIT (creates topics) ───────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:latest
+    platform: linux/arm64
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    networks:
+      - news-net
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        cub kafka-ready -b kafka:9092 1 60
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic raw_news --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic processed_news --partitions 1 --replication-factor 1
+        echo "Topics created successfully."
+        kafka-topics --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  # ───── CRAWLER SERVICE ────────────────────────────────────────────────────
+  crawler-service:
+    build:
+      context: ./crawler-service
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    container_name: crawler-service
+    hostname: crawler-service
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_RAW_TOPIC:-raw_news}
+      CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───── TELEGRAM SERVICE ───────────────────────────────────────────────────
+  telegram-service:
+    build:
+      context: ./telegram-service
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    container_name: telegram-service
+    hostname: telegram-service
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Phase 1: reads raw_news; Phase 2: switch to processed_news
+      KAFKA_TOPIC: ${TELEGRAM_KAFKA_TOPIC:-raw_news}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-telegram-consumer-group}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───── FLINK JOB MANAGER (PHASE 2 — enable with --profile flink) ─────────
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    platform: linux/amd64   # official Flink image is amd64; works on M-series via Rosetta
+    container_name: flink-jobmanager
+    hostname: flink-jobmanager
+    restart: unless-stopped
+    profiles: ["flink"]
+    depends_on:
+      - kafka
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    ports:
+      - "8081:8081"   # Flink Web UI
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    networks:
+      - news-net
+
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12-java11
+    platform: linux/amd64
+    container_name: flink-taskmanager
+    hostname: flink-taskmanager
+    restart: unless-stopped
+    profiles: ["flink"]
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    networks:
+      - news-net
+
+  # ───── FLINK JOB SUBMITTER (PHASE 2) ─────────────────────────────────────
+  flink-job:
+    build:
+      context: ./flink-job
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: flink-job
+    hostname: flink-job
+    restart: "no"
+    profiles: ["flink"]
+    depends_on:
+      - flink-taskmanager
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FLINK_MASTER: flink-jobmanager:8081
+    networks:
+      - news-net
+
+  # ───── MINIO (PHASE 3 — enable with --profile storage) ───────────────────
+  minio:
+    image: minio/minio:latest
+    platform: linux/arm64
+    container_name: minio
+    hostname: minio
+    restart: unless-stopped
+    profiles: ["storage"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console UI
+    volumes:
+      - minio-data:/data
+    networks:
+      - news-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
