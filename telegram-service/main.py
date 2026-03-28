@@ -6,9 +6,13 @@ them to a Telegram channel via the Bot API.
 
 Features:
 - Reads BOT_TOKEN and CHANNEL_ID from env (REQUIRED — fails fast if missing)
+- Alert filtering: respects `should_alert` field from processed_news payloads
+  Set TELEGRAM_ONLY_ALERT_MATCHED=true (default) to skip non-matching articles.
+  Set TELEGRAM_ONLY_ALERT_MATCHED=false to send everything regardless.
+  Phase 1 payloads (raw_news, no `should_alert` field) always trigger an alert.
 - Rate limiting: ≤1 message/second (Telegram limit)
 - Exponential-backoff retry on send failures
-- Clean JSON message handling
+- Supports both Phase 1 (raw_news) and Phase 2 (processed_news) payloads
 - Full structured logging
 """
 
@@ -68,6 +72,14 @@ CHANNEL_ID: str = _require_env("CHANNEL_ID")
 KAFKA_BOOTSTRAP_SERVERS: str = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC: str = os.environ.get("KAFKA_TOPIC", "raw_news")
 KAFKA_GROUP_ID: str = os.environ.get("KAFKA_GROUP_ID", "telegram-consumer-group")
+
+# Alert filter behaviour.
+# When True (default): skip articles where should_alert=False.
+# When False: send every article regardless of should_alert.
+# Phase 1 payloads (no should_alert field) are ALWAYS sent regardless of this flag.
+TELEGRAM_ONLY_ALERT_MATCHED: bool = (
+    os.environ.get("TELEGRAM_ONLY_ALERT_MATCHED", "true").strip().lower() == "true"
+)
 
 # Telegram Bot API
 TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -228,10 +240,11 @@ def create_consumer(retries: int = 15, delay: int = 5) -> KafkaConsumer:
 def main() -> None:
     logger.info("=" * 60)
     logger.info("Telegram Service starting up")
-    logger.info("  Kafka:      %s", KAFKA_BOOTSTRAP_SERVERS)
-    logger.info("  Topic:      %s", KAFKA_TOPIC)
-    logger.info("  Group:      %s", KAFKA_GROUP_ID)
-    logger.info("  Channel:    %s", CHANNEL_ID)
+    logger.info("  Kafka:              %s", KAFKA_BOOTSTRAP_SERVERS)
+    logger.info("  Topic:              %s", KAFKA_TOPIC)
+    logger.info("  Group:              %s", KAFKA_GROUP_ID)
+    logger.info("  Channel:            %s", CHANNEL_ID)
+    logger.info("  Only alert matched: %s", TELEGRAM_ONLY_ALERT_MATCHED)
     logger.info("=" * 60)
 
     consumer = create_consumer()
@@ -247,7 +260,7 @@ def main() -> None:
                     logger.warning("Unexpected message format (not a dict): %r", article)
                     continue
 
-                article_id = article.get("id", "unknown")
+                article_id = article.get("article_id", article.get("id", "unknown"))
                 title = article.get("title", "")[:60]
                 logger.info(
                     "Received [partition=%d offset=%d]: [%s] %s",
@@ -256,6 +269,21 @@ def main() -> None:
                     article_id,
                     title,
                 )
+
+                # ── Alert filter ────────────────────────────────────────────
+                # should_alert field is set by crawler + processor keyword rules.
+                # Missing field (Phase 1 / raw_news payload) = always alert.
+                # When TELEGRAM_ONLY_ALERT_MATCHED=true, skip articles where
+                # should_alert is explicitly False.
+                if TELEGRAM_ONLY_ALERT_MATCHED and "should_alert" in article:
+                    if not article["should_alert"]:
+                        matched_kws = article.get("matched_keywords", [])
+                        logger.info(
+                            "ALERT SKIP [%s] — no keyword match (feed rules). "
+                            "Set TELEGRAM_ONLY_ALERT_MATCHED=false to send all. matched_keywords=%r",
+                            title, matched_kws,
+                        )
+                        continue
 
                 # Rate limiting — enforce minimum gap between sends
                 now = time.monotonic()

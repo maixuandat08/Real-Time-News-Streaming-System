@@ -1,12 +1,16 @@
-# 📡 Real-Time News Streaming System
+# Real-Time News Streaming System
 
-A production-style real-time news pipeline:
+A production-style realtime news pipeline with a clean Phase 2 processing layer:
 
 ```
-Crawler → Kafka → (Flink Enrichment) → Telegram Service → Telegram Channel
+Crawler -> Kafka(raw_news) -> Processor Service -> Kafka(processed_news) -> Telegram
 ```
 
-Fully containerized with Docker. Runs on **Apple Silicon (M1/M2/M3)**.
+Optional extras remain available:
+- `Flink` profile for experimentation
+- `storage` profile with `MinIO + Iceberg REST catalog + Iceberg writer + Trino`
+
+Fully containerized with Docker. Runs on Apple Silicon (M1/M2/M3).
 
 ---
 
@@ -23,10 +27,25 @@ demo_etl/
 │   ├── requirements.txt
 │   ├── main.py              # Kafka consumer + Telegram sender
 │   └── test_telegram.py     # Standalone bot test
+├── processor-service/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── classifier.py
+│   ├── normalizer.py
+│   ├── main.py              # raw_news -> processed_news
+│   └── test_processor.py
+├── iceberg-writer/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── main.py              # processed_news -> Iceberg on MinIO
+│   └── test_iceberg_writer.py
+├── trino/
+│   └── catalog/
+│       └── iceberg.properties
 ├── flink-job/
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   └── job.py               # Stream enrichment + deduplication
+│   └── job.py               # Optional experimental profile
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
@@ -101,10 +120,10 @@ Expected output:
 
 ### Recommended Settings
 1. Docker Desktop → Settings → General:
-   - ✅ **Use Rosetta for x86/amd64 emulation** (required for Flink)
+   - Enable Rosetta for x86/amd64 emulation only if you plan to run the optional `flink` profile
 
 2. Docker Desktop → Settings → Resources:
-   - Memory: **≥4 GB** (6 GB recommended for Phase 2 with Flink)
+   - Memory: **≥4 GB** (6 GB recommended if you also run the optional `flink` profile)
    - CPUs: **≥2**
 
 ---
@@ -117,8 +136,7 @@ docker-compose up --build
 
 This starts:
 | Service | Role |
-|---|---|
-| `zookeeper` | Kafka coordination |
+| --- | --- |
 | `kafka` | Message broker |
 | `kafka-init` | Creates topics (`raw_news`, `processed_news`) |
 | `crawler-service` | Fetches RSS → publishes to `raw_news` |
@@ -149,28 +167,22 @@ docker exec kafka kafka-console-consumer.sh \
 
 ---
 
-## 🟡 Phase 2: Add Stream Processing (Flink)
+## 🟡 Phase 2: Processor Service
 
-The Flink job enriches articles with:
-- **Deduplication** (10-min TTL window)
-- **Keyword extraction** (Vietnamese + English taxonomy)
-- **Category classification** (Chính trị, Kinh tế, Công nghệ, etc.)
-- **Summary generation**
+Phase 2 is the built-in `processor-service`. It consumes `raw_news`, performs deterministic enrichment, and publishes a cleaner `processed_news` stream.
 
-### 2.1 — Start Flink
+Phase 2 responsibilities:
+- deduplication within the current processor session
+- rule-based category classification
+- keyword extraction
+- summary normalization
+- stable `article_id`
+- `published_at` semantics based on RSS publish time when available
+- manual Kafka commit after successful downstream publish
+- live crawl mode with persistent seen-URL state
+- one-shot backfill mode with `--limit` and `--days`
 
-```bash
-docker-compose --profile flink up --build
-```
-
-This adds:
-| Service | Role |
-|---|---|
-| `flink-jobmanager` | Flink coordinator (Web UI: `http://localhost:8081`) |
-| `flink-taskmanager` | Flink worker |
-| `flink-job` | Submits the enrichment job |
-
-### 2.2 — Switch Telegram to `processed_news`
+### 2.1 — Switch Telegram to `processed_news`
 
 Edit `.env`:
 
@@ -178,17 +190,42 @@ Edit `.env`:
 TELEGRAM_KAFKA_TOPIC=processed_news
 ```
 
-Restart telegram-service:
+### 2.2 — Start or rebuild the Phase 2 stack
 
 ```bash
-docker-compose restart telegram-service
+docker compose up --build
 ```
 
-### 2.3 — Verify Flink
+If the stack is already running:
 
 ```bash
-docker-compose logs -f flink-job         # See enrichment logs
-docker-compose logs -f flink-jobmanager  # Check job status
+docker compose up -d --build processor-service telegram-service
+```
+
+### 2.3 — Live Mode vs Backfill Mode
+
+Default container behavior is `live` mode:
+- crawler polls configured feeds repeatedly
+- only unseen articles are emitted
+- state is persisted so restart does not immediately resend old URLs
+
+Run a one-shot backfill manually when you want historical ingest:
+
+```bash
+docker compose run --rm crawler-service python main.py --mode backfill --limit 100
+```
+
+Backfill by recent publish window:
+
+```bash
+docker compose run --rm crawler-service python main.py --mode backfill --days 7
+```
+
+### 2.4 — Verify Phase 2
+
+```bash
+docker compose logs -f processor-service
+docker compose logs -f telegram-service
 
 # Watch processed_news topic
 docker exec kafka kafka-console-consumer.sh \
@@ -197,8 +234,99 @@ docker exec kafka kafka-console-consumer.sh \
   --from-beginning \
   --max-messages 3
 ```
+You should see `processor-service` logging successful publishes into `processed_news`, then `telegram-service` consuming those enriched records.
 
-Open Flink Web UI: **http://localhost:8081**
+## 🧪 Optional: Experimental Flink Profile
+
+The old Flink-based processing path is still available as an optional profile for experimentation:
+
+```bash
+docker compose --profile flink up --build
+```
+
+Use it only if you explicitly want to experiment with Flink on top of the main stack.
+
+---
+
+## 🟣 Phase 3: Storage Profile (`MinIO + Iceberg + Trino`)
+
+Phase 3 now has a real storage path. When you enable the `storage` profile:
+
+```text
+Kafka(processed_news)
+  -> iceberg-writer
+  -> Iceberg table news.processed_news
+  -> MinIO bucket news-archive
+  -> Trino SQL queries
+```
+
+What is real today:
+- `iceberg-writer` consumes `processed_news`
+- it creates or loads the Iceberg table `news.processed_news`
+- data files and metadata are stored under `s3://news-archive/warehouse/...` in MinIO
+- Trino is preconfigured with an Iceberg REST catalog and can query that table
+
+What is still not built yet:
+- a separate Bronze raw table for `raw_news`
+- downstream Gold aggregate tables
+- retention/compaction jobs
+
+### 3.1 — Start the storage stack
+
+```bash
+docker compose --profile storage up --build
+```
+
+This adds:
+| Service | Role |
+| --- | --- |
+| `minio` | S3-compatible object storage |
+| `iceberg-rest` | Iceberg metadata catalog |
+| `iceberg-writer` | Consumes `processed_news` and appends to Iceberg |
+| `trino` | SQL query engine over the Iceberg catalog |
+
+### 3.2 — Verify writer activity
+
+```bash
+docker compose logs -f iceberg-writer
+```
+
+You should see logs confirming:
+- the MinIO bucket exists or was created
+- the Iceberg table `news.processed_news` is ready
+- batches are appended and Kafka offsets are committed after the append
+
+### 3.3 — Query via Trino
+
+Show schemas:
+
+```bash
+docker exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
+```
+
+Show tables:
+
+```bash
+docker exec trino trino --execute "SHOW TABLES FROM iceberg.news"
+```
+
+Read recent rows:
+
+```bash
+docker exec trino trino --execute "
+SELECT article_id, source, title, published_at, should_alert
+FROM iceberg.news.processed_news
+ORDER BY kafka_offset DESC
+LIMIT 10
+"
+```
+
+### 3.4 — Where MinIO data is stored
+
+Inside this project, MinIO data is not written as normal files in the repo tree.
+It lives in the Docker volume `minio-data`, mounted in the container at `/data`.
+
+The Iceberg catalog metadata store is persisted in the Docker volume `iceberg-rest-data`.
 
 ---
 
@@ -258,7 +386,7 @@ docker inspect kafka | grep -A 5 '"Health"'
 
 ---
 
-### ❌ Flink: Platform / Architecture Issues
+### ❌ Optional Flink: Platform / Architecture Issues
 
 **Symptom:** `exec format error` or image pulling fails
 
@@ -303,22 +431,25 @@ CRAWL_INTERVAL_SECONDS=30   # in .env
   "content": "Mô tả ngắn...",
   "url": "https://...",
   "source": "VNExpress",
-  "timestamp": 1711234567
+  "timestamp": 1711234567,
+  "published_ts": 1711230000
 }
 ```
 
 ### `processed_news` (Kafka Topic — Phase 2)
 ```json
 {
-  "id": "uuid",
+  "article_id": "6f9b9e6cc2d8b7d7f8e49d4fe1adf1aa",
   "title": "Tiêu đề bài viết",
   "summary": "Tóm tắt...",
   "url": "https://...",
-  "keywords": ["kinh tế", "đầu tư"],
-  "category": "Kinh tế",
+  "keywords": ["ai", "openai", "cloud"],
+  "category": "Công nghệ",
   "source": "VNExpress",
-  "timestamp": 1711234567,
-  "processed_at": 1711234580
+  "published_at": "2026-03-28T03:12:00Z",
+  "ingested_at": "2026-03-28T03:12:18Z",
+  "raw_hash": "2adf...",
+  "is_duplicate": false
 }
 ```
 
@@ -339,27 +470,28 @@ CRAWL_INTERVAL_SECONDS=30   # in .env
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Docker Network (news-net)        │
-│                                                   │
-│  ┌──────────────┐    raw_news     ┌───────────┐   │
-│  │   crawler    │ ─────────────► │   kafka   │   │
-│  │  (Python)    │                │  :9092    │   │
-│  └──────────────┘                └─────┬─────┘   │
-│                                        │          │
-│                             ┌──────────┴──────┐  │
-│                             │                 │  │
-│                   ┌─────────▼──────┐  ┌───────▼──┐│
-│                   │  flink-job     │  │ telegram  ││
-│                   │ (Phase 2)      │  │ -service  ││
-│                   │ dedup+enrich   │  │           ││
-│                   └───────┬────────┘  └──────┬────┘│
-│                           │ processed_news   │     │
-│                           └──────────────────┘     │
-└─────────────────────────────────────────────────────┘
-                                           │
-                                     ┌─────▼──────┐
-                                     │  Telegram  │
-                                     │  Channel   │
-                                     └────────────┘
+┌────────────────────────────────────────────────────┐
+│              Docker Network (news-net)            │
+│                                                    │
+│  ┌──────────────┐      raw_news      ┌──────────┐  │
+│  │ crawler      │ ─────────────────► │  kafka   │  │
+│  │ service      │                    │ :9092    │  │
+│  └──────────────┘                    └────┬─────┘  │
+│                                           │         │
+│                                 ┌─────────▼────────┐│
+│                                 │ processor-service ││
+│                                 │ classify+dedup    ││
+│                                 └─────────┬────────┘│
+│                                           │          │
+│                                    processed_news   │
+│                                           │          │
+│                                 ┌─────────▼────────┐│
+│                                 │ telegram-service ││
+│                                 └─────────┬────────┘│
+└───────────────────────────────────────────┼──────────┘
+                                            │
+                                      ┌─────▼─────┐
+                                      │ Telegram  │
+                                      │ Channel   │
+                                      └───────────┘
 ```

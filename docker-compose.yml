@@ -1,7 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Real-Time News Streaming System
-# Phase 1: zookeeper + kafka + crawler-service + telegram-service
-# Phase 2: flink (use --profile flink to enable)
+# Phase 1 (default): kafka + crawler-service + telegram-service + processor-service
+# Phase 2 opt:       + flink            (--profile flink)
+# Phase 3 opt:       + minio + iceberg-rest + iceberg-writer + trino  (--profile storage)
 # ─────────────────────────────────────────────────────────────────────────────
 
 networks:
@@ -12,6 +13,8 @@ volumes:
   kafka-data:
   flink-checkpoints:
   minio-data:
+  iceberg-rest-data:
+  crawler-state:     # persistent URL state for live mode
 
 services:
 
@@ -65,6 +68,8 @@ services:
           --topic raw_news --partitions 1 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
           --topic processed_news --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic iceberg_archive --partitions 1 --replication-factor 1
         echo "Topics created successfully."
         kafka-topics --bootstrap-server kafka:9092 --list
     restart: "no"
@@ -86,7 +91,13 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: ${KAFKA_RAW_TOPIC:-raw_news}
       CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-60}
+      CRAWLER_MODE: ${CRAWLER_MODE:-live}
+      FEEDS_CONFIG_PATH: /app/feeds.yaml
+      CRAWLER_STATE_FILE: /data/crawler_state.json
+      CRAWLER_STATE_MAX_URLS: ${CRAWLER_STATE_MAX_URLS:-50000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - crawler-state:/data    # persistent URL dedup state (live mode)
     networks:
       - news-net
     logging:
@@ -122,7 +133,38 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ───── FLINK JOB MANAGER (PHASE 2 — enable with --profile flink) ─────────
+  # ───── PROCESSOR SERVICE (PHASE 2) ───────────────────────────────────────
+  # Consumes raw_news → normalizes schema → publishes processed_news
+  # Runs in the default stack — no profile needed.
+  # telegram-service is unchanged; it still reads from TELEGRAM_KAFKA_TOPIC.
+  processor-service:
+    build:
+      context: ./processor-service
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    container_name: processor-service
+    hostname: processor-service
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PROCESSOR_INPUT_TOPIC: ${KAFKA_RAW_TOPIC:-raw_news}
+      PROCESSOR_OUTPUT_TOPIC: ${KAFKA_PROCESSED_TOPIC:-processed_news}
+      PROCESSOR_GROUP_ID: ${PROCESSOR_GROUP_ID:-processor-consumer-group}
+      PROCESSOR_DEDUP_WINDOW: ${PROCESSOR_DEDUP_WINDOW:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
   flink-jobmanager:
     image: flink:1.18-scala_2.12-java11
     platform: linux/amd64   # official Flink image is amd64; works on M-series via Rosetta
@@ -191,7 +233,6 @@ services:
     networks:
       - news-net
 
-  # ───── MINIO (PHASE 3 — enable with --profile storage) ───────────────────
   minio:
     image: minio/minio:latest
     platform: linux/arm64
@@ -204,8 +245,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console UI
+      - "9000:9000"   # S3 API (boto3 / aws cli / mc)
+      - "9001:9001"   # MinIO Console UI → http://localhost:9001
     volumes:
       - minio-data:/data
     networks:
@@ -215,3 +256,99 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    platform: linux/arm64
+    container_name: iceberg-rest
+    hostname: iceberg-rest
+    user: "0:0"
+    restart: unless-stopped
+    profiles: ["storage"]
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      AWS_REGION: ${MINIO_REGION:-us-east-1}
+      CATALOG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-s3://news-archive/warehouse}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:sqlite:file:/var/lib/iceberg-rest/catalog.db
+    ports:
+      - "8181:8181"
+    volumes:
+      - iceberg-rest-data:/var/lib/iceberg-rest
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───── ICEBERG WRITER (PHASE 3 — REAL STORAGE PATH) ───────────────────────
+  # Consumes processed_news and appends to a real Iceberg table on MinIO.
+  iceberg-writer:
+    build:
+      context: ./iceberg-writer
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    container_name: iceberg-writer
+    hostname: iceberg-writer
+    restart: unless-stopped
+    profiles: ["storage"]
+    depends_on:
+      - kafka
+      - minio
+      - iceberg-rest
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ICEBERG_INPUT_TOPIC: ${KAFKA_PROCESSED_TOPIC:-processed_news}
+      ICEBERG_GROUP_ID: ${ICEBERG_GROUP_ID:-iceberg-writer-group}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_BUCKET: ${MINIO_BUCKET:-news-archive}
+      ICEBERG_CATALOG_NAME: ${ICEBERG_CATALOG_NAME:-news}
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI:-http://iceberg-rest:8181}
+      ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-s3://news-archive/warehouse}
+      ICEBERG_NAMESPACE: ${ICEBERG_NAMESPACE:-news}
+      ICEBERG_TABLE: ${ICEBERG_TABLE:-processed_news}
+      ICEBERG_BATCH_SIZE: ${ICEBERG_BATCH_SIZE:-100}
+      ICEBERG_BATCH_TIMEOUT: ${ICEBERG_BATCH_TIMEOUT:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───── TRINO (PHASE 3 — READS ICEBERG VIA REST CATALOG) ───────────────────
+  trino:
+    image: trinodb/trino:439
+    platform: linux/amd64    # official image is amd64; works via Rosetta
+    container_name: trino
+    hostname: trino
+    restart: unless-stopped
+    profiles: ["storage"]
+    depends_on:
+      - minio
+      - iceberg-rest
+    ports:
+      - "8080:8080"    # Trino Web UI + JDBC endpoint
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    networks:
+      - news-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
