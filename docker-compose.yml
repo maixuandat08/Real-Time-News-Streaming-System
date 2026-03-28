@@ -91,7 +91,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: ${KAFKA_RAW_TOPIC:-raw_news}
       CRAWL_INTERVAL_SECONDS: ${CRAWL_INTERVAL_SECONDS:-60}
-      CRAWLER_MODE: ${CRAWLER_MODE:-live}
+      CRAWLER_MODE: ${CRAWLER_MODE:-realtime}
       FEEDS_CONFIG_PATH: /app/feeds.yaml
       CRAWLER_STATE_FILE: /data/crawler_state.json
       CRAWLER_STATE_MAX_URLS: ${CRAWLER_STATE_MAX_URLS:-50000}
@@ -121,9 +121,12 @@ services:
       - .env
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # Phase 1: reads raw_news; Phase 2: switch to processed_news
+      # Phase 1: reads raw_news. Phase 2: switch to processed_news via TELEGRAM_KAFKA_TOPIC.
       KAFKA_TOPIC: ${TELEGRAM_KAFKA_TOPIC:-raw_news}
       KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-telegram-consumer-group}
+      # latest (default): never replay backlog on new group (realtime mode)
+      # earliest: replay from beginning (use with backfill + telegram)
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-latest}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     networks:
       - news-net

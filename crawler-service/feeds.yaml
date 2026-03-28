@@ -25,75 +25,230 @@
 
 feeds:
 
-  - name: "VNExpress - Tin mới nhất"
-    url: "https://vnexpress.net/rss/tin-moi-nhat.rss"
-    enabled: true
-    category_hint: "general"
-    include_keywords: []   # empty = alert all (default behavior)
-    exclude_keywords:
-      - "quảng cáo"
-      - "sponsored"
+  # ─── VIETNAM DOMESTIC POLITICS ────────────────────────────────────────────
 
   - name: "VNExpress - Thời sự"
     url: "https://vnexpress.net/rss/thoi-su.rss"
     enabled: true
-    category_hint: "politics"
+    category_hint: "vietnam_politics"
     include_keywords: []
     exclude_keywords: []
 
-  - name: "VNExpress - Thế giới"
-    url: "https://vnexpress.net/rss/the-gioi.rss"
+  - name: "Vietnam News - Politics & Laws"
+    url: "https://vietnamnews.vn/rss/politics-laws.rss"
     enabled: true
-    category_hint: "world"
+    category_hint: "vietnam_politics"
     include_keywords: []
     exclude_keywords: []
+
+  # ─── GLOBAL POLITICS / WORLD AFFAIRS ──────────────────────────────────────
+
+  - name: "BBC News - Politics"
+    url: "https://feeds.bbci.co.uk/news/politics/rss.xml"
+    enabled: true
+    category_hint: "world_politics"
+    include_keywords: []
+    exclude_keywords: []
+
+  - name: "BBC News - World"
+    url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+    enabled: true
+    category_hint: "world_politics"
+    include_keywords:
+      - "government"
+      - "president"
+      - "prime minister"
+      - "minister"
+      - "parliament"
+      - "election"
+      - "policy"
+      - "sanction"
+      - "diplomatic"
+      - "war"
+      - "ceasefire"
+      - "ukraine"
+      - "china"
+      - "russia"
+      - "israel"
+      - "gaza"
+    exclude_keywords: []
+
+  - name: "NYTimes - Politics"
+    url: "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"
+    enabled: true
+    category_hint: "world_politics"
+    include_keywords: []
+    exclude_keywords: []
+
+  - name: "NYTimes - World"
+    url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+    enabled: true
+    category_hint: "world_politics"
+    include_keywords:
+      - "government"
+      - "president"
+      - "prime minister"
+      - "minister"
+      - "parliament"
+      - "election"
+      - "policy"
+      - "sanction"
+      - "diplomatic"
+      - "war"
+      - "ceasefire"
+      - "ukraine"
+      - "china"
+      - "russia"
+      - "israel"
+      - "gaza"
+    exclude_keywords: []
+
+  - name: "WSJ - World News"
+    url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+    enabled: true
+    category_hint: "world_politics"
+    include_keywords:
+      - "government"
+      - "president"
+      - "prime minister"
+      - "minister"
+      - "parliament"
+      - "election"
+      - "policy"
+      - "sanction"
+      - "diplomatic"
+      - "war"
+      - "ceasefire"
+      - "ukraine"
+      - "china"
+      - "russia"
+      - "israel"
+      - "gaza"
+    exclude_keywords: []
+
+  # ─── VIETNAM GOLD / FUEL UPDATES ──────────────────────────────────────────
 
   - name: "VNExpress - Kinh doanh"
     url: "https://vnexpress.net/rss/kinh-doanh.rss"
     enabled: true
-    category_hint: "economy"
+    category_hint: "vietnam_gold_fuel"
     include_keywords:
+      - "giá vàng"
+      - "vàng"
+      - "xăng"
+      - "giá xăng"
+      - "xăng dầu"
+      - "dầu"
+      - "nhiên liệu"
+      - "brent"
+      - "wti"
       - "chứng khoán"
       - "vn-index"
       - "lãi suất"
       - "ngân hàng"
       - "đầu tư"
-      - "gdp"
-      - "startup"
     exclude_keywords:
       - "thể thao"
 
-  - name: "VNExpress - Công nghệ"
-    url: "https://vnexpress.net/rss/khoa-hoc.rss"
+  # ─── GLOBAL GOLD / ENERGY / FUEL ──────────────────────────────────────────
+
+  - name: "EIA - Gasoline and Diesel Fuel Update"
+    url: "https://www.eia.gov/petroleum/gasdiesel/includes/gas_diesel_rss.xml"
     enabled: true
-    category_hint: "technology"
-    include_keywords:
-      - "ai"
-      - "trí tuệ nhân tạo"
-      - "chatgpt"
-      - "blockchain"
-      - "chip"
-      - "robot"
+    category_hint: "global_energy"
+    include_keywords: []
     exclude_keywords: []
 
-  - name: "BBC World News"
-    url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+  - name: "EIA - Today in Energy"
+    url: "https://www.eia.gov/rss/todayinenergy.xml"
     enabled: true
-    category_hint: "world"
+    category_hint: "global_energy"
     include_keywords:
-      - "ukraine"
-      - "china"
-      - "trump"
-      - "ai"
-      - "climate"
+      - "oil"
+      - "crude"
+      - "gasoline"
+      - "diesel"
+      - "fuel"
+      - "natural gas"
+      - "lng"
+      - "brent"
+      - "wti"
+      - "gold"
+    exclude_keywords: []
+
+  - name: "EIA - Press Releases"
+    url: "https://www.eia.gov/rss/press_rss.xml"
+    enabled: true
+    category_hint: "global_energy"
+    include_keywords:
+      - "oil"
+      - "gasoline"
+      - "diesel"
+      - "fuel"
+      - "natural gas"
+      - "energy"
+      - "prices"
+    exclude_keywords: []
+
+  - name: "BBC News - Business"
+    url: "https://feeds.bbci.co.uk/news/business/rss.xml"
+    enabled: true
+    category_hint: "global_economy"
+    include_keywords:
+      - "gold"
+      - "oil"
+      - "gas"
+      - "fuel"
+      - "inflation"
+      - "interest rate"
+      - "central bank"
+      - "market"
       - "economy"
-      - "war"
+      - "trade"
     exclude_keywords: []
 
-  # Example of a disabled feed — won't be crawled
-  - name: "Reuters World"
-    url: "https://feeds.reuters.com/Reuters/worldNews"
-    enabled: false
-    category_hint: "world"
+  - name: "NYTimes - Economy"
+    url: "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml"
+    enabled: true
+    category_hint: "global_economy"
+    include_keywords: []
+    exclude_keywords: []
+
+  # ─── GLOBAL FINANCE ────────────────────────────────────────────────────────
+
+  - name: "WSJ - Markets Main"
+    url: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+    enabled: true
+    category_hint: "global_finance"
+    include_keywords: []
+    exclude_keywords: []
+
+  - name: "World Bank - News"
+    url: "https://search.worldbank.org/api/v2/news?format=atom"
+    enabled: true
+    category_hint: "global_economy"
+    include_keywords:
+      - "economy"
+      - "growth"
+      - "inflation"
+      - "market"
+      - "finance"
+      - "development"
+      - "trade"
+    exclude_keywords: []
+
+  # ─── GLOBAL SPORTS ─────────────────────────────────────────────────────────
+
+  - name: "BBC Sport - Global"
+    url: "https://feeds.bbci.co.uk/sport/rss.xml"
+    enabled: true
+    category_hint: "global_sports"
+    include_keywords: []
+    exclude_keywords: []
+
+  - name: "ESPN - Global Sports News"
+    url: "https://www.espn.com/espn/rss/news"
+    enabled: true
+    category_hint: "global_sports"
     include_keywords: []
     exclude_keywords: []

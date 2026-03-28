@@ -46,7 +46,8 @@ should_alert = _feed_config.should_alert
 PersistentUrlState = _main.PersistentUrlState
 parse_args = _main.parse_args
 run_backfill = _main.run_backfill
-_should_include_in_backfill = _main._should_include_in_backfill
+realtime_crawl_once = _main._realtime_crawl_once
+
 
 
 # ─── FeedConfig / load_feeds ─────────────────────────────────────────────────
@@ -268,45 +269,105 @@ class TestPersistentUrlState:
         assert state.size() == 0
 
 
-class TestBackfillFilters:
-    def test_includes_everything_without_cutoff(self):
-        article = {"published_ts": 1700000000}
-        assert _should_include_in_backfill(article, None) is True
+# ─── Realtime startup_ts filter (inline unit tests) ─────────────────────────
+# The startup_ts filter is embedded inside _realtime_crawl_once which is async
+# and requires a full Kafka setup. We test the FILTER LOGIC directly here via
+# a helper that mirrors the exact conditions from the main code.
 
-    def test_includes_when_published_ts_is_new_enough(self):
-        assert _should_include_in_backfill({"published_ts": 200}, 100) is True
+def _passes_realtime_filter(article: dict, startup_ts: int) -> tuple[bool, str]:
+    """Mirror of the realtime filter logic in _realtime_crawl_once.
+    Returns (passes: bool, reason: str) for assertion messages.
+    """
+    pub_ts = article.get("published_ts")
+    if pub_ts is None:
+        return False, "no_ts"
+    if pub_ts < startup_ts:
+        return False, "old"
+    return True, "ok"
 
-    def test_excludes_when_published_ts_is_too_old(self):
-        assert _should_include_in_backfill({"published_ts": 50}, 100) is False
 
-    def test_includes_when_published_ts_missing(self):
-        assert _should_include_in_backfill({}, 100) is True
+class TestRealtimeFilter:
+    """Tests for the startup_ts filter that prevents backlog replay."""
 
-    def test_includes_when_published_ts_invalid(self):
-        assert _should_include_in_backfill({"published_ts": "bad"}, 100) is True
+    def test_article_newer_than_startup_passes(self):
+        assert _passes_realtime_filter({"published_ts": 200}, startup_ts=100) == (True, "ok")
 
+    def test_article_at_exact_startup_ts_passes(self):
+        assert _passes_realtime_filter({"published_ts": 100}, startup_ts=100) == (True, "ok")
+
+    def test_article_older_than_startup_is_skipped(self):
+        passed, reason = _passes_realtime_filter({"published_ts": 50}, startup_ts=100)
+        assert passed is False
+        assert reason == "old"
+
+    def test_article_with_no_published_ts_is_skipped(self):
+        passed, reason = _passes_realtime_filter({}, startup_ts=100)
+        assert passed is False
+        assert reason == "no_ts"
+
+    def test_article_with_none_published_ts_is_skipped(self):
+        passed, reason = _passes_realtime_filter({"published_ts": None}, startup_ts=100)
+        assert passed is False
+        assert reason == "no_ts"
+
+
+# ─── parse_args (new CLI) ───────────────────────────────────────────────
 
 class TestParseArgs:
-    def test_parse_backfill_limit_and_days(self):
-        args = parse_args(["--mode", "backfill", "--limit", "10", "--days", "7"])
+    def test_default_mode_is_realtime(self, monkeypatch):
+        monkeypatch.delenv("CRAWLER_MODE", raising=False)
+        args = parse_args([])
+        assert args.mode == "realtime"
+
+    def test_backfill_mode_accepted(self):
+        args = parse_args(["--mode", "backfill"])
         assert args.mode == "backfill"
-        assert args.limit == 10
+
+    def test_per_feed_limit_parsed(self):
+        args = parse_args(["--mode", "backfill", "--per-feed-limit", "50"])
+        assert args.per_feed_limit == 50
+
+    def test_total_limit_parsed(self):
+        args = parse_args(["--mode", "backfill", "--total-limit", "200"])
+        assert args.total_limit == 200
+
+    def test_days_parsed(self):
+        args = parse_args(["--mode", "backfill", "--days", "7"])
         assert args.days == 7
 
-    def test_parse_defaults(self):
-        args = parse_args([])
-        assert args.mode in {"live", "backfill"}
-        assert args.limit is None
+    def test_all_backfill_flags_together(self):
+        args = parse_args(["--mode", "backfill", "--per-feed-limit", "10", "--days", "3", "--total-limit", "50"])
+        assert args.mode == "backfill"
+        assert args.per_feed_limit == 10
+        assert args.days == 3
+        assert args.total_limit == 50
+
+    def test_no_per_feed_limit_defaults_to_none(self):
+        args = parse_args(["--mode", "backfill"])
+        assert args.per_feed_limit is None
+
+    def test_no_total_limit_defaults_to_none(self):
+        args = parse_args(["--mode", "backfill"])
+        assert args.total_limit is None
+
+    def test_no_days_defaults_to_none(self):
+        args = parse_args(["--mode", "backfill"])
         assert args.days is None
 
-    def test_limit_must_be_positive(self):
+    def test_per_feed_limit_must_be_positive(self):
         with pytest.raises(SystemExit):
-            parse_args(["--limit", "0"])
+            parse_args(["--mode", "backfill", "--per-feed-limit", "0"])
+
+    def test_total_limit_must_be_positive(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--mode", "backfill", "--total-limit", "-1"])
 
     def test_days_must_be_positive(self):
         with pytest.raises(SystemExit):
-            parse_args(["--days", "-1"])
+            parse_args(["--mode", "backfill", "--days", "0"])
 
+
+# ─── run_backfill integration (feed fake) ─────────────────────────────────
 
 class TestRunBackfill:
     class _FakeProducer:
@@ -320,7 +381,18 @@ class TestRunBackfill:
         def flush(self, timeout=None):
             self.flush_calls += 1
 
-    def test_limit_stops_publish_early(self, monkeypatch):
+    def _fake_article(self, feed_name, article_id, pub_ts=200):
+        return {
+            "id": f"{feed_name}-{article_id}",
+            "title": f"{feed_name} article {article_id}",
+            "content": "",
+            "url": f"https://example.com/{feed_name}/{article_id}",
+            "source": feed_name,
+            "should_alert": True,
+            "published_ts": pub_ts,
+        }
+
+    def test_total_limit_stops_across_feeds(self, monkeypatch):
         feeds = [
             FeedConfig(name="Feed A", url="https://example.com/a"),
             FeedConfig(name="Feed B", url="https://example.com/b"),
@@ -331,34 +403,36 @@ class TestRunBackfill:
             return f"xml::{url}"
 
         def fake_parse(raw_xml, feed):
-            return [
-                {
-                    "id": f"{feed.name}-1",
-                    "title": f"{feed.name} one",
-                    "content": "",
-                    "url": f"https://example.com/{feed.name}/1",
-                    "source": feed.name,
-                    "should_alert": True,
-                    "published_ts": 200,
-                },
-                {
-                    "id": f"{feed.name}-2",
-                    "title": f"{feed.name} two",
-                    "content": "",
-                    "url": f"https://example.com/{feed.name}/2",
-                    "source": feed.name,
-                    "should_alert": False,
-                    "published_ts": 200,
-                },
-            ]
+            return [self._fake_article(feed.name, i) for i in range(3)]
 
         monkeypatch.setattr(_main, "fetch_feed", fake_fetch)
         monkeypatch.setattr(_main, "parse_feed", fake_parse)
 
-        asyncio.run(run_backfill(feeds, producer, limit=2, days=None))
+        asyncio.run(run_backfill(feeds, producer, per_feed_limit=None, total_limit=4, days=None))
 
-        assert len(producer.records) == 2
+        assert len(producer.records) == 4
         assert producer.flush_calls == 1
+
+    def test_per_feed_limit_caps_each_feed(self, monkeypatch):
+        feeds = [
+            FeedConfig(name="Feed A", url="https://example.com/a"),
+            FeedConfig(name="Feed B", url="https://example.com/b"),
+        ]
+        producer = self._FakeProducer()
+
+        async def fake_fetch(session, url):
+            return f"xml::{url}"
+
+        def fake_parse(raw_xml, feed):
+            return [self._fake_article(feed.name, i) for i in range(5)]
+
+        monkeypatch.setattr(_main, "fetch_feed", fake_fetch)
+        monkeypatch.setattr(_main, "parse_feed", fake_parse)
+
+        asyncio.run(run_backfill(feeds, producer, per_feed_limit=2, total_limit=None, days=None))
+
+        # Each of 2 feeds capped at 2 → total 4
+        assert len(producer.records) == 4
 
     def test_days_filter_skips_old_articles(self, monkeypatch):
         feeds = [FeedConfig(name="Feed A", url="https://example.com/a")]
@@ -369,31 +443,88 @@ class TestRunBackfill:
 
         def fake_parse(raw_xml, feed):
             return [
-                {
-                    "id": "new",
-                    "title": "new",
-                    "content": "",
-                    "url": "https://example.com/new",
-                    "source": feed.name,
-                    "should_alert": True,
-                    "published_ts": 999_000,
-                },
-                {
-                    "id": "old",
-                    "title": "old",
-                    "content": "",
-                    "url": "https://example.com/old",
-                    "source": feed.name,
-                    "should_alert": True,
-                    "published_ts": 100,
-                },
+                self._fake_article(feed.name, "new", pub_ts=999_000),
+                self._fake_article(feed.name, "old", pub_ts=100),
             ]
 
         monkeypatch.setattr(_main, "fetch_feed", fake_fetch)
         monkeypatch.setattr(_main, "parse_feed", fake_parse)
         monkeypatch.setattr(_main.time, "time", lambda: 1_000_000)
 
-        asyncio.run(run_backfill(feeds, producer, limit=None, days=1))
+        asyncio.run(run_backfill(feeds, producer, per_feed_limit=None, total_limit=None, days=1))
 
         assert len(producer.records) == 1
-        assert producer.records[0]["value"]["id"] == "new"
+        assert producer.records[0]["value"]["id"] == "Feed A-new"
+
+    def test_no_published_ts_is_included_in_backfill(self, monkeypatch):
+        """Articles without published_ts should be included in backfill (conservative)."""
+        feeds = [FeedConfig(name="Feed A", url="https://example.com/a")]
+        producer = self._FakeProducer()
+
+        async def fake_fetch(session, url):
+            return "xml"
+
+        def fake_parse(raw_xml, feed):
+            art = self._fake_article(feed.name, "no-ts")
+            art["published_ts"] = None
+            return [art]
+
+        monkeypatch.setattr(_main, "fetch_feed", fake_fetch)
+        monkeypatch.setattr(_main, "parse_feed", fake_parse)
+        monkeypatch.setattr(_main.time, "time", lambda: 1_000_000)
+
+        asyncio.run(run_backfill(feeds, producer, per_feed_limit=None, total_limit=None, days=1))
+
+        # Published_ts=None with days filter active → conservative include
+        assert len(producer.records) == 1
+
+
+class TestRealtimeWarmState:
+    class _FakeProducer:
+        def __init__(self):
+            self.records = []
+            self.flush_calls = 0
+
+        def send(self, topic, key=None, value=None):
+            self.records.append({"topic": topic, "key": key, "value": value})
+
+        def flush(self, timeout=None):
+            self.flush_calls += 1
+
+    def _article(self, article_id, url, published_ts):
+        return {
+            "id": article_id,
+            "title": article_id,
+            "content": "",
+            "url": url,
+            "source": "Feed A",
+            "should_alert": True,
+            "published_ts": published_ts,
+        }
+
+    def test_old_and_missing_timestamp_urls_are_warmed_into_state(self, monkeypatch):
+        producer = self._FakeProducer()
+        state, _ = TestPersistentUrlState()._state()
+        feeds = [FeedConfig(name="Feed A", url="https://example.com/a")]
+        articles = [
+            self._article("old", "https://example.com/old", 50),
+            self._article("no-ts", "https://example.com/no-ts", None),
+            self._article("new", "https://example.com/new", 150),
+        ]
+
+        async def fake_fetch(session, url):
+            return "xml"
+
+        def fake_parse(raw_xml, feed):
+            return list(articles)
+
+        monkeypatch.setattr(_main, "fetch_feed", fake_fetch)
+        monkeypatch.setattr(_main, "parse_feed", fake_parse)
+
+        first = asyncio.run(realtime_crawl_once(None, producer, feeds, state, startup_ts=100))
+        second = asyncio.run(realtime_crawl_once(None, producer, feeds, state, startup_ts=100))
+
+        assert first == (1, 1, 1, 0)
+        assert second == (0, 0, 0, 3)
+        assert state.size() == 3
+        assert len(producer.records) == 1

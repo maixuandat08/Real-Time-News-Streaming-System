@@ -32,6 +32,7 @@ sys.modules["telegram_service_main"] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 format_message = MODULE.format_message
+build_effective_group_id = MODULE.build_effective_group_id
 
 
 def test_format_message_with_processed_news_payload():
@@ -65,3 +66,37 @@ def test_format_message_without_keywords_or_category_uses_source():
 
     assert "📌 <i>VNExpress</i>" in message
     assert "🏷" not in message
+
+
+def test_format_message_strips_html_from_summary_preview():
+    article = {
+        "title": "Tin mới",
+        "summary": '<a href="https://example.com"><img src="https://img" /></a>UBND TP Hà Nội khen thưởng...',
+        "url": "https://example.com/story",
+        "source": "VNExpress",
+        "keywords": ["ai"],
+    }
+
+    message = format_message(article)
+
+    assert '<a href="https://example.com"><img' not in message
+    assert "UBND TP Hà Nội khen thưởng..." in message
+    assert 'href="https://example.com/story"' in message
+
+
+def test_build_effective_group_id_scopes_by_mode():
+    assert build_effective_group_id("telegram-consumer-group", "realtime", True) == (
+        "telegram-consumer-group-realtime"
+    )
+
+
+def test_build_effective_group_id_keeps_existing_suffix():
+    assert build_effective_group_id("telegram-consumer-group-backfill", "backfill", True) == (
+        "telegram-consumer-group-backfill"
+    )
+
+
+def test_build_effective_group_id_can_disable_mode_scoping():
+    assert build_effective_group_id("telegram-consumer-group", "realtime", False) == (
+        "telegram-consumer-group"
+    )

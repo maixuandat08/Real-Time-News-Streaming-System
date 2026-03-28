@@ -179,8 +179,8 @@ Phase 2 responsibilities:
 - stable `article_id`
 - `published_at` semantics based on RSS publish time when available
 - manual Kafka commit after successful downstream publish
-- live crawl mode with persistent seen-URL state
-- one-shot backfill mode with `--limit` and `--days`
+- realtime crawl mode with startup-time filtering and persistent seen-URL state
+- one-shot backfill mode with per-feed / total limits and optional `--days`
 
 ### 2.1 — Switch Telegram to `processed_news`
 
@@ -202,26 +202,77 @@ If the stack is already running:
 docker compose up -d --build processor-service telegram-service
 ```
 
-### 2.3 — Live Mode vs Backfill Mode
+### 2.3 — Realtime Mode vs Backfill Mode
 
-Default container behavior is `live` mode:
-- crawler polls configured feeds repeatedly
-- only unseen articles are emitted
-- state is persisted so restart does not immediately resend old URLs
+The crawler has **two clearly-scoped modes**, controlled by the `CRAWLER_MODE` env var or `--mode` CLI flag.
 
-Run a one-shot backfill manually when you want historical ingest:
+#### Realtime Mode (default)
 
-```bash
-docker compose run --rm crawler-service python main.py --mode backfill --limit 100
+```
+CRAWLER_MODE=realtime   # in .env
 ```
 
-Backfill by recent publish window:
+- Records `startup_ts` (Unix timestamp) when the service starts.
+- **Only publishes articles where `published_ts >= startup_ts`.**
+- Articles with **no `published_ts`** in the RSS feed are **skipped** (no timestamp guarantee).
+- Uses a persistent state file to prevent re-sending the same URL across subsequent poll cycles.
+- First boot does **not** flush any backlog already in the feeds.
+
+This is the safe default: you will only receive articles that were published *after* you started the system.
+
+#### Backfill Mode (historical ingest)
 
 ```bash
-docker compose run --rm crawler-service python main.py --mode backfill --days 7
+# Publish everything currently in all feeds (no limit)
+docker compose run --rm crawler-service python main.py --mode backfill
+
+# Last 7 days only, at most 100 articles per feed
+docker compose run --rm crawler-service python main.py --mode backfill --days 7 --per-feed-limit 100
+
+# Hard total cap across all feeds
+docker compose run --rm crawler-service python main.py --mode backfill --total-limit 500
+
+# All three combined
+docker compose run --rm crawler-service \
+  python main.py --mode backfill --days 14 --per-feed-limit 200 --total-limit 2000
 ```
 
-### 2.4 — Verify Phase 2
+**Backfill flags:**
+
+| Flag | Description |
+|---|---|
+| `--days N` | Only include articles published in the last N days. Uses `published_ts`. Articles with no timestamp are **included** (conservative). |
+| `--per-feed-limit N` | Stop each individual feed after N articles are published. |
+| `--total-limit N` | Hard cap across all feeds combined. |
+
+Backfill **does not** use the persistent state file — it intentionally re-publishes all found articles.
+
+#### Keyword Rules and Alerting
+
+Keywords in `feeds.yaml` (`include_keywords`, `exclude_keywords`) control the `should_alert` field that is set on each article. They do **not** block ingest — every article is still published to Kafka. The `should_alert` field is used downstream by the Telegram service to decide whether to send the article to the channel.
+
+### 2.4 — Telegram Offset Reset Behaviour
+
+When Telegram starts with a **new consumer group** (first run or after `docker compose down -v`):
+
+| `KAFKA_AUTO_OFFSET_RESET` | Behaviour |
+|---|---|
+| `latest` (default) | Starts from the most recent message — no backlog replay. Correct for realtime mode. |
+| `earliest` | Replays all messages from the beginning — use this with backfill so the articles reach Telegram. |
+
+Set in `.env`:
+```env
+KAFKA_AUTO_OFFSET_RESET=earliest  # alongside a backfill run
+KAFKA_AUTO_OFFSET_RESET=latest    # normal realtime operation (default)
+```
+
+> **Note:** This setting only affects **new** consumer groups. If the group already has committed offsets (e.g. you ran previously), Kafka ignores `auto_offset_reset` and picks up where it left off.
+>
+> To make switching between modes easier, the Telegram service scopes the effective group ID by crawler mode by default:
+> `telegram-consumer-group-realtime` and `telegram-consumer-group-backfill`.
+> This behaviour is controlled by `KAFKA_GROUP_ID_SCOPE_BY_MODE=true`.
+
+### 2.5 — Verify Phase 2
 
 ```bash
 docker compose logs -f processor-service

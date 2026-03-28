@@ -1,24 +1,37 @@
 """
 Crawler Service — Real-Time News Streaming System
 
-Supports two modes:
-  live mode (default): Runs continuously, fetches feeds on interval.
-                       Tracks seen URLs in a persistent JSON state file.
-                       Only publishes articles not seen before (per state file).
-  backfill mode:       One-shot run. Reads ALL entries from enabled feeds
-                       and publishes them without checking state.
-                       Use with --mode backfill [--limit N] from the CLI.
+Supports two modes controlled by CRAWLER_MODE env or --mode CLI flag:
 
-Reads feed list + keyword rules from feeds.yaml (via feed_config.py).
-Each article in raw_news includes:
-  - matched_feed_name  : source feed name
-  - should_alert       : bool, from keyword rules in feeds.yaml
-  - matched_keywords   : list[str], keywords that triggered the alert
+  realtime (default):
+    Crawls continuously on a fixed interval.
+    Records startup_ts at launch. Only publishes articles where:
+      - published_ts exists AND published_ts >= startup_ts
+    Articles with no published_ts are silently skipped (realtime guarantee).
+    Uses PersistentUrlState to avoid re-publishing the same URL across cycles.
+    Goal: zero backlog on first boot — only fresh, newly-published articles land
+    in the topic while the service is running.
 
-State file (live mode):
-  JSON file at CRAWLER_STATE_FILE (default: /data/crawler_state.json)
+  backfill:
+    One-shot historical ingest of all enabled feeds.
+    No startup_ts filter — publishes every article found in each feed.
+    No URL state check — sends even previously-seen URLs (clean re-ingest).
+    Supports --per-feed-limit N  : stop each feed after N articles published.
+    Supports --days N            : skip articles older than N days (uses published_ts;
+                                   articles with no published_ts are included).
+    Supports --total-limit N     : hard cap across all feeds.
+    Logs per-feed progress and totals clearly.
+
+Feed config: feeds.yaml (via feed_config.py)
+Each raw_news article includes:
+  - matched_feed_name / should_alert / matched_keywords  (keyword alert metadata)
+  - published_ts  (real RSS publish timestamp, seconds UTC, or None)
+  - timestamp     (ingestion/fetch time, always present)
+
+State file (realtime mode):
+  JSON at CRAWLER_STATE_FILE (default: /data/crawler_state.json)
   Format: {"seen_urls": ["sha256...", ...]}
-  Persists across restarts. Bounded to CRAWLER_STATE_MAX_URLS entries.
+  Bounded to CRAWLER_STATE_MAX_URLS entries (FIFO eviction).
 """
 
 import argparse
@@ -52,7 +65,7 @@ FEEDS_CONFIG_PATH: str = os.environ.get(
     os.path.join(os.path.dirname(__file__), "feeds.yaml"),
 )
 
-# Live mode state file — persists seen URL hashes across restarts
+# Realtime mode state file — persists seen URL hashes across restarts
 CRAWLER_STATE_FILE: str = os.environ.get("CRAWLER_STATE_FILE", "/data/crawler_state.json")
 CRAWLER_STATE_MAX_URLS: int = int(os.environ.get("CRAWLER_STATE_MAX_URLS", "50000"))
 
@@ -66,13 +79,15 @@ logging.basicConfig(
 logger = logging.getLogger("crawler-service")
 
 
-# ─── Persistent State (live mode) ─────────────────────────────────────────────
+# ─── Persistent URL State (realtime mode dedup) ───────────────────────────────
 
 class PersistentUrlState:
-    """File-backed URL deduplication state for live mode.
+    """File-backed URL deduplication state for realtime mode.
 
     Persists across restarts via a JSON file.
     Keeps at most max_size URL hashes (evicts oldest on overflow).
+    NOTE: This only prevents re-sending the *same URL* across cycles.
+          The startup_ts filter (not this class) prevents sending old articles.
     """
 
     def __init__(self, path: str, max_size: int = 50_000):
@@ -112,7 +127,7 @@ class PersistentUrlState:
         return hashlib.sha256(url.strip().lower().encode()).hexdigest()
 
     def is_new(self, url: str) -> bool:
-        """Return True if URL is new, and register it (persisting to disk)."""
+        """Return True if URL is first-seen, and register it immediately."""
         fp = self._fingerprint(url)
         if fp in self._seen:
             return False
@@ -189,7 +204,7 @@ def parse_feed(raw_xml: str, feed: FeedConfig) -> list[dict]:
             or ""
         ).strip()
 
-        # Real article publish time from RSS (UTC safe via calendar.timegm)
+        # Real article publish time from RSS (UTC-safe via calendar.timegm)
         published_ts: Optional[int] = None
         for time_field in ("published_parsed", "updated_parsed"):
             parsed_time = entry.get(time_field)
@@ -210,7 +225,7 @@ def parse_feed(raw_xml: str, feed: FeedConfig) -> list[dict]:
             "url": url,
             "source": feed.name,
             "matched_feed_name": feed.name,
-            "timestamp": int(time.time()),       # ingestion/fetch time
+            "timestamp": int(time.time()),       # ingestion/fetch time (always set)
             "published_ts": published_ts,         # real RSS publish time or None
             "should_alert": alert,
             "matched_keywords": matched_kws,
@@ -231,15 +246,27 @@ def publish(producer: KafkaProducer, article: dict) -> bool:
         return False
 
 
-# ─── Live Mode ────────────────────────────────────────────────────────────────
+# ─── Realtime Mode ────────────────────────────────────────────────────────────
 
-async def run_live(feeds: list[FeedConfig], producer: KafkaProducer) -> None:
-    """Continuous crawl loop with persistent URL state.
+async def run_realtime(feeds: list[FeedConfig], producer: KafkaProducer) -> None:
+    """Continuous crawl loop — only publishes articles newer than startup.
 
-    Only publishes articles not seen in previous runs (state file).
+    Semantics:
+    - startup_ts is captured ONCE when the service starts.
+    - First-seen URLs are registered in PersistentUrlState immediately.
+    - Articles with published_ts < startup_ts → skipped (old backlog).
+    - Articles with no published_ts            → skipped (no timestamp guarantee).
+    - PersistentUrlState prevents re-scanning the same backlog URLs forever.
+    - Rate: every CRAWL_INTERVAL_SECONDS seconds.
     """
+    startup_ts: int = int(time.time())
     state = PersistentUrlState(CRAWLER_STATE_FILE, max_size=CRAWLER_STATE_MAX_URLS)
-    logger.info("Live mode — state file: %s (%d URLs loaded)", CRAWLER_STATE_FILE, state.size())
+
+    logger.info("=== REALTIME MODE ===")
+    logger.info("  startup_ts:  %s (%s UTC)", startup_ts, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(startup_ts)))
+    logger.info("  State file:  %s (%d URLs loaded)", CRAWLER_STATE_FILE, state.size())
+    logger.info("  Only articles with published_ts >= startup_ts will be published.")
+    logger.info("  Articles with no published_ts are skipped (realtime guarantee).")
 
     connector = aiohttp.TCPConnector(limit=10, ssl=False)
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
@@ -247,30 +274,40 @@ async def run_live(feeds: list[FeedConfig], producer: KafkaProducer) -> None:
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while True:
             try:
-                logger.info("Live crawl cycle starting — %d feeds", len(feeds))
-                published = await _crawl_once(session, producer, feeds, state)
-                logger.info("Live cycle done — published %d new articles.", published)
+                published, skipped_old, skipped_no_ts, skipped_dedup = await _realtime_crawl_once(
+                    session, producer, feeds, state, startup_ts
+                )
+                logger.info(
+                    "Realtime cycle done — published=%d  skip_old=%d  skip_no_ts=%d  skip_dedup=%d",
+                    published, skipped_old, skipped_no_ts, skipped_dedup,
+                )
             except Exception as exc:
-                logger.exception("Unexpected error in live cycle: %s", exc)
+                logger.exception("Unexpected error in realtime cycle: %s", exc)
             finally:
                 logger.info("Next crawl in %ds.", CRAWL_INTERVAL_SECONDS)
                 await asyncio.sleep(CRAWL_INTERVAL_SECONDS)
 
 
-async def _crawl_once(
+async def _realtime_crawl_once(
     session: aiohttp.ClientSession,
     producer: KafkaProducer,
     feeds: list[FeedConfig],
-    state: Optional[PersistentUrlState],  # None in backfill mode
-) -> int:
-    """Fetch all feeds concurrently and publish new articles.
+    state: PersistentUrlState,
+    startup_ts: int,
+) -> tuple[int, int, int, int]:
+    """Fetch all feeds, apply realtime filters, publish new articles.
 
-    state=None means backfill mode — no dedup, publish everything.
+    Returns:
+        (published, skipped_old, skipped_no_ts, skipped_dedup)
     """
     tasks = [fetch_feed(session, f.url) for f in feeds]
     results = await asyncio.gather(*tasks)
 
     published = 0
+    skipped_old = 0
+    skipped_no_ts = 0
+    skipped_dedup = 0
+
     for feed, raw_xml in zip(feeds, results):
         if raw_xml is None:
             logger.warning("No data from feed '%s'", feed.name)
@@ -278,154 +315,200 @@ async def _crawl_once(
 
         articles = parse_feed(raw_xml, feed)
         for article in articles:
-            # Live mode: skip already-seen URLs
-            if state is not None and not state.is_new(article["url"]):
-                logger.debug("Live-dedup skip: %s", article["url"])
+            # Warm state on first encounter, even if the article is skipped
+            # by realtime filters. This snapshots today's backlog once and
+            # prevents reprocessing the same old/no-ts URLs every cycle.
+            if not state.is_new(article["url"]):
+                skipped_dedup += 1
+                logger.debug("SKIP dedup: %s", article["url"])
+                continue
+
+            pub_ts = article.get("published_ts")
+
+            # Filter 1: no timestamp → skip (realtime guarantee)
+            if pub_ts is None:
+                skipped_no_ts += 1
+                logger.debug("SKIP no-ts: [%s] %s", feed.name, article["title"][:50])
+                continue
+
+            # Filter 2: older than startup → skip (backlog guard)
+            if pub_ts < startup_ts:
+                skipped_old += 1
+                logger.debug("SKIP old: [%s] %s (published_ts=%d < startup_ts=%d)", feed.name, article["title"][:50], pub_ts, startup_ts)
                 continue
 
             if publish(producer, article):
                 published += 1
                 alert_tag = " [ALERT]" if article["should_alert"] else ""
-                logger.info(
-                    "[%s]%s Published: %s",
-                    feed.name, alert_tag, article["title"][:60],
-                )
+                logger.info("[%s]%s Published: %s", feed.name, alert_tag, article["title"][:60])
 
     try:
         producer.flush(timeout=10)
     except KafkaError as exc:
         logger.error("Kafka flush error: %s", exc)
 
-    return published
+    return published, skipped_old, skipped_no_ts, skipped_dedup
 
 
-# ─── Backfill Mode ─────────────────────────────────────────────────
-
-def _should_include_in_backfill(article: dict, cutoff_ts: Optional[int]) -> bool:
-    """Return True if an article should be included in the current backfill run.
-
-    Rules:
-    - If no cutoff is configured, include everything.
-    - If article has a valid published_ts, include only when published_ts >= cutoff.
-    - If published_ts is missing/None, include it conservatively rather than drop it.
-    """
-    if cutoff_ts is None:
-        return True
-
-    published_ts = article.get("published_ts")
-    if published_ts is None:
-        return True
-
-    try:
-        return int(published_ts) >= cutoff_ts
-    except (TypeError, ValueError):
-        return True
+# ─── Backfill Mode ────────────────────────────────────────────────────────────
 
 async def run_backfill(
     feeds: list[FeedConfig],
     producer: KafkaProducer,
-    limit: Optional[int],
+    per_feed_limit: Optional[int],
+    total_limit: Optional[int],
     days: Optional[int],
 ) -> None:
-    """One-shot backfill: publishes entries from all enabled feeds.
-
-    Ignores state file — intended for historical re-ingestion.
+    """One-shot historical ingest from all enabled feeds.
 
     Args:
-        limit: Stop after publishing this many articles total (None = no limit).
-               Enforced per-article immediately when the count is reached.
-        days:  Only publish articles whose published_ts is within the last N days.
-               If an article has no published_ts, it is included (unknown age →
-               conservative include rather than silent drop).
+        per_feed_limit: Max articles published per individual feed.
+                        Feed stops immediately when reached (not post-hoc).
+                        None = no per-feed limit.
+        total_limit:    Hard cap across all feeds combined.
+                        None = no total limit.
+        days:           Only include articles published within the last N days.
+                        Uses published_ts. Articles with no published_ts are
+                        INCLUDED (conservative: unknown age ≠ old).
+                        None = no time filter.
+
+    Does NOT use PersistentUrlState — intentionally re-publishes all found entries.
     """
     cutoff_ts: Optional[int] = None
     if days is not None:
         cutoff_ts = int(time.time()) - days * 86400
-        logger.info(
-            "Backfill mode — limit=%s days=%d (cutoff: articles after %s)",
-            limit or "unlimited", days,
-            time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts)),
-        )
+
+    logger.info("=== BACKFILL MODE ===")
+    logger.info("  per_feed_limit: %s", per_feed_limit or "unlimited")
+    logger.info("  total_limit:    %s", total_limit or "unlimited")
+    if cutoff_ts:
+        logger.info("  days filter:    %d  (cutoff: after %s UTC)", days, time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts)))
     else:
-        logger.info("Backfill mode — limit=%s days=unlimited", limit or "unlimited")
+        logger.info("  days filter:    none")
 
     connector = aiohttp.TCPConnector(limit=10, ssl=False)
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
-    total = 0
-    reached_limit = False
+
+    grand_total = 0
+    done = False  # set True when total_limit reached
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         tasks = [fetch_feed(session, f.url) for f in feeds]
         results = await asyncio.gather(*tasks)
 
         for feed, raw_xml in zip(feeds, results):
+            if done:
+                break
             if raw_xml is None:
-                logger.warning("No data from feed '%s'", feed.name)
+                logger.warning("No data from feed '%s' — skipping.", feed.name)
                 continue
 
             articles = parse_feed(raw_xml, feed)
+            feed_published = 0
+            feed_skipped_old = 0
+            feed_skipped_no_limit = 0
+
             for article in articles:
-                if not _should_include_in_backfill(article, cutoff_ts):
-                    logger.debug(
-                        "Backfill skip by days filter: %s | published_ts=%r cutoff=%r",
-                        article.get("url", ""),
-                        article.get("published_ts"),
-                        cutoff_ts,
-                    )
+                if done:
+                    break
+
+                # Days filter (articles with no published_ts are included)
+                pub_ts = article.get("published_ts")
+                if cutoff_ts is not None and pub_ts is not None and pub_ts < cutoff_ts:
+                    feed_skipped_old += 1
+                    logger.debug("SKIP old: [%s] %s", feed.name, article["title"][:50])
                     continue
 
+                # Per-feed limit (checked before publish)
+                if per_feed_limit is not None and feed_published >= per_feed_limit:
+                    feed_skipped_no_limit += 1
+                    continue
+
+                # Total limit (checked before publish)
+                if total_limit is not None and grand_total >= total_limit:
+                    logger.info("Total limit %d reached — stopping backfill.", total_limit)
+                    done = True
+                    break
+
                 if publish(producer, article):
-                    total += 1
+                    feed_published += 1
+                    grand_total += 1
                     alert_tag = " [ALERT]" if article["should_alert"] else ""
                     logger.info(
-                        "[%s]%s Backfill published: %s",
-                        feed.name,
-                        alert_tag,
+                        "[%s]%s Backfill (%d/%s total): %s",
+                        feed.name, alert_tag,
+                        grand_total, total_limit or "∞",
                         article["title"][:60],
                     )
 
-                if limit is not None and total >= limit:
-                    logger.info("Backfill limit %d reached.", limit)
-                    reached_limit = True
-                    break
+            logger.info(
+                "Feed '%s' done — published=%d  skip_old=%d  skip_per_feed_limit=%d",
+                feed.name, feed_published, feed_skipped_old, feed_skipped_no_limit,
+            )
 
-            if reached_limit:
-                break
+    try:
+        producer.flush(timeout=15)
+    except KafkaError as exc:
+        logger.error("Kafka flush error: %s", exc)
 
-    producer.flush(timeout=15)
-    logger.info("Backfill complete — published %d articles.", total)
+    logger.info("Backfill complete — total published: %d", grand_total)
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def _positive_int(value: str) -> int:
-    """argparse helper: require a positive integer."""
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be > 0")
     return parsed
 
-
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="News Crawler Service")
-    parser.add_argument(
-        "--mode",
-        choices=["live", "backfill"],
-        default=os.environ.get("CRAWLER_MODE", "live"),
-        help="live (default): continuous crawl with state tracking. "
-             "backfill: one-shot re-ingest without state.",
+    parser = argparse.ArgumentParser(
+        description="News Crawler Service — realtime or backfill mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Realtime (default): only publishes articles published after startup
+  python main.py
+
+  # Backfill: publish everything in all feeds (no limit)
+  python main.py --mode backfill
+
+  # Backfill: at most 10 articles per feed
+  python main.py --mode backfill --per-feed-limit 10
+
+  # Backfill: last 7 days only, max 500 total
+  python main.py --mode backfill --days 7 --total-limit 500
+""",
     )
     parser.add_argument(
-        "--limit",
+        "--mode",
+        choices=["realtime", "backfill"],
+        default=os.environ.get("CRAWLER_MODE", "realtime"),
+        help="realtime (default): only articles newer than startup. "
+             "backfill: one-shot historical ingest.",
+    )
+    parser.add_argument(
+        "--per-feed-limit",
         type=_positive_int,
         default=None,
-        help="Backfill mode only: max articles to publish.",
+        metavar="N",
+        help="[backfill] Stop each feed after publishing N articles.",
+    )
+    parser.add_argument(
+        "--total-limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="[backfill] Hard cap on total articles published across all feeds.",
     )
     parser.add_argument(
         "--days",
         type=_positive_int,
         default=None,
-        help="Backfill mode only: include only articles from the last N days.",
+        metavar="N",
+        help="[backfill] Only include articles published within the last N days "
+             "(uses published_ts; articles with no timestamp are included).",
     )
     return parser.parse_args(argv)
 
@@ -440,7 +523,6 @@ async def main() -> None:
     logger.info("  Feeds file:  %s", FEEDS_CONFIG_PATH)
     logger.info("=" * 60)
 
-    # Load and validate feed config — fail fast if broken
     try:
         feeds = load_feeds(FEEDS_CONFIG_PATH)
     except (FileNotFoundError, ValueError) as exc:
@@ -460,9 +542,15 @@ async def main() -> None:
     producer = create_producer()
 
     if args.mode == "backfill":
-        await run_backfill(feeds, producer, limit=args.limit, days=args.days)
+        await run_backfill(
+            feeds,
+            producer,
+            per_feed_limit=args.per_feed_limit,
+            total_limit=args.total_limit,
+            days=args.days,
+        )
     else:
-        await run_live(feeds, producer)
+        await run_realtime(feeds, producer)
 
 
 if __name__ == "__main__":

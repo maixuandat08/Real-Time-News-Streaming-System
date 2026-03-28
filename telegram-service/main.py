@@ -10,6 +10,15 @@ Features:
   Set TELEGRAM_ONLY_ALERT_MATCHED=true (default) to skip non-matching articles.
   Set TELEGRAM_ONLY_ALERT_MATCHED=false to send everything regardless.
   Phase 1 payloads (raw_news, no `should_alert` field) always trigger an alert.
+- Offset reset: KAFKA_AUTO_OFFSET_RESET controls replay behaviour.
+    latest   (default) — never replay old backlog when a new consumer group joins.
+                         Use this for realtime mode (crawler --mode realtime).
+    earliest             — read from the beginning of the topic.
+                         Use this when running a backfill and you want Telegram
+                         to send those historical articles too.
+  Group scoping: KAFKA_GROUP_ID_SCOPE_BY_MODE=true (default) isolates offsets
+                 for realtime vs backfill by suffixing the effective group ID.
+                 Example: telegram-consumer-group-realtime.
 - Rate limiting: ≤1 message/second (Telegram limit)
 - Exponential-backoff retry on send failures
 - Supports both Phase 1 (raw_news) and Phase 2 (processed_news) payloads
@@ -19,9 +28,10 @@ Features:
 import json
 import logging
 import os
+import re
 import sys
 import time
-from html import escape
+from html import escape, unescape
 from typing import Optional
 
 import httpx
@@ -72,6 +82,20 @@ CHANNEL_ID: str = _require_env("CHANNEL_ID")
 KAFKA_BOOTSTRAP_SERVERS: str = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC: str = os.environ.get("KAFKA_TOPIC", "raw_news")
 KAFKA_GROUP_ID: str = os.environ.get("KAFKA_GROUP_ID", "telegram-consumer-group")
+CRAWLER_MODE: str = os.environ.get("CRAWLER_MODE", "realtime").strip().lower()
+
+# Offset reset policy:
+#   latest   (default) — don't replay backlog when the service starts fresh.
+#                        Safe default for realtime mode: only sends new articles.
+#   earliest           — replay from the beginning; use alongside backfill mode.
+# NOTE: this setting only affects NEW consumer groups (no committed offset yet).
+#       An existing group with committed offsets always picks up where it left off.
+KAFKA_AUTO_OFFSET_RESET: str = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "latest")
+# Scope effective Telegram consumer offsets by crawler mode, so switching
+# between realtime and backfill does not silently reuse the same offsets.
+KAFKA_GROUP_ID_SCOPE_BY_MODE: bool = (
+    os.environ.get("KAFKA_GROUP_ID_SCOPE_BY_MODE", "true").strip().lower() == "true"
+)
 
 # Alert filter behaviour.
 # When True (default): skip articles where should_alert=False.
@@ -99,6 +123,26 @@ CATEGORY_EMOJIS = {
 DEFAULT_EMOJI = "📡"
 
 
+def build_effective_group_id(base_group_id: str, crawler_mode: str, scope_by_mode: bool) -> str:
+    """Return the Kafka consumer group ID that should be used for this mode."""
+    if not scope_by_mode:
+        return base_group_id
+
+    mode = crawler_mode if crawler_mode in {"realtime", "backfill"} else "realtime"
+    suffix = f"-{mode}"
+    if base_group_id.endswith(suffix):
+        return base_group_id
+    return f"{base_group_id}{suffix}"
+
+
+def _clean_preview_text(value: str) -> str:
+    """Strip embedded HTML from feed summaries for Telegram text output."""
+    text = unescape(value or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 # ─── Telegram Sender ──────────────────────────────────────────────────────────
 
 def format_message(article: dict) -> str:
@@ -110,7 +154,7 @@ def format_message(article: dict) -> str:
     url: str = escape(article.get("url", ""), quote=True)
 
     # For processed_news: use summary + keywords if available
-    summary: str = article.get("summary", article.get("content", "")).strip()
+    summary: str = _clean_preview_text(article.get("summary", article.get("content", "")))
     keywords: list = article.get("keywords", [])
     category: str = escape(article.get("category", ""))
     source = escape(source)
@@ -199,13 +243,18 @@ def send_to_telegram(client: httpx.Client, text: str) -> bool:
 
 def create_consumer(retries: int = 15, delay: int = 5) -> KafkaConsumer:
     """Create a Kafka consumer with retry logic for startup."""
+    effective_group_id = build_effective_group_id(
+        KAFKA_GROUP_ID,
+        CRAWLER_MODE,
+        KAFKA_GROUP_ID_SCOPE_BY_MODE,
+    )
     for attempt in range(1, retries + 1):
         try:
             consumer = KafkaConsumer(
                 KAFKA_TOPIC,
                 bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
-                group_id=KAFKA_GROUP_ID,
-                auto_offset_reset="earliest",
+                group_id=effective_group_id,
+                auto_offset_reset=KAFKA_AUTO_OFFSET_RESET,
                 enable_auto_commit=True,
                 auto_commit_interval_ms=5000,
                 value_deserializer=lambda v: json.loads(v.decode("utf-8")),
@@ -216,7 +265,7 @@ def create_consumer(retries: int = 15, delay: int = 5) -> KafkaConsumer:
             logger.info(
                 "Kafka consumer connected — topic: %s, group: %s (attempt %d/%d)",
                 KAFKA_TOPIC,
-                KAFKA_GROUP_ID,
+                effective_group_id,
                 attempt,
                 retries,
             )
@@ -238,12 +287,21 @@ def create_consumer(retries: int = 15, delay: int = 5) -> KafkaConsumer:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    effective_group_id = build_effective_group_id(
+        KAFKA_GROUP_ID,
+        CRAWLER_MODE,
+        KAFKA_GROUP_ID_SCOPE_BY_MODE,
+    )
     logger.info("=" * 60)
     logger.info("Telegram Service starting up")
     logger.info("  Kafka:              %s", KAFKA_BOOTSTRAP_SERVERS)
     logger.info("  Topic:              %s", KAFKA_TOPIC)
-    logger.info("  Group:              %s", KAFKA_GROUP_ID)
+    logger.info("  Crawler mode:       %s", CRAWLER_MODE)
+    logger.info("  Group base:         %s", KAFKA_GROUP_ID)
+    logger.info("  Group effective:    %s", effective_group_id)
+    logger.info("  Group scope mode:   %s", KAFKA_GROUP_ID_SCOPE_BY_MODE)
     logger.info("  Channel:            %s", CHANNEL_ID)
+    logger.info("  Offset reset:       %s", KAFKA_AUTO_OFFSET_RESET)
     logger.info("  Only alert matched: %s", TELEGRAM_ONLY_ALERT_MATCHED)
     logger.info("=" * 60)
 
