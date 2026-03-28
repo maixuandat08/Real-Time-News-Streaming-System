@@ -21,7 +21,6 @@ services:
   # ───── KAFKA ─────────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:latest
-    platform: linux/arm64
     container_name: kafka
     hostname: kafka
     restart: unless-stopped
@@ -53,7 +52,6 @@ services:
   # ───── KAFKA INIT (creates topics) ───────────────────────────────────────
   kafka-init:
     image: confluentinc/cp-kafka:latest
-    platform: linux/arm64
     container_name: kafka-init
     depends_on:
       - kafka
@@ -79,7 +77,6 @@ services:
     build:
       context: ./crawler-service
       dockerfile: Dockerfile
-    platform: linux/arm64
     container_name: crawler-service
     hostname: crawler-service
     restart: unless-stopped
@@ -111,7 +108,6 @@ services:
     build:
       context: ./telegram-service
       dockerfile: Dockerfile
-    platform: linux/arm64
     container_name: telegram-service
     hostname: telegram-service
     restart: unless-stopped
@@ -144,7 +140,6 @@ services:
     build:
       context: ./processor-service
       dockerfile: Dockerfile
-    platform: linux/arm64
     container_name: processor-service
     hostname: processor-service
     restart: unless-stopped
@@ -238,7 +233,6 @@ services:
 
   minio:
     image: minio/minio:latest
-    platform: linux/arm64
     container_name: minio
     hostname: minio
     restart: unless-stopped
@@ -262,7 +256,6 @@ services:
 
   iceberg-rest:
     image: tabulario/iceberg-rest:1.6.0
-    platform: linux/arm64
     container_name: iceberg-rest
     hostname: iceberg-rest
     user: "0:0"
@@ -297,7 +290,6 @@ services:
     build:
       context: ./iceberg-writer
       dockerfile: Dockerfile
-    platform: linux/arm64
     container_name: iceberg-writer
     hostname: iceberg-writer
     restart: unless-stopped
